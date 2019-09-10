@@ -17,6 +17,7 @@ package com.netflix.hystrix;
 
 import com.netflix.hystrix.HystrixCircuitBreaker.NoOpCircuitBreaker;
 import com.netflix.hystrix.HystrixCommandProperties.ExecutionIsolationStrategy;
+import com.netflix.hystrix.exception.ExceptionNotWrappedByHystrix;
 import com.netflix.hystrix.exception.HystrixBadRequestException;
 import com.netflix.hystrix.exception.HystrixRuntimeException;
 import com.netflix.hystrix.exception.HystrixRuntimeException.FailureType;
@@ -381,9 +382,15 @@ import java.util.concurrent.atomic.AtomicReference;
         final Action0 unsubscribeCommandCleanup = new Action0() {
             @Override
             public void call() {
+                circuitBreaker.markNonSuccess();
                 if (_cmd.commandState.compareAndSet(CommandState.OBSERVABLE_CHAIN_CREATED, CommandState.UNSUBSCRIBED)) {
                     if (!_cmd.executionResult.containsTerminalEvent()) {
                         _cmd.eventNotifier.markEvent(HystrixEventType.CANCELLED, _cmd.commandKey);
+                        try {
+                            executionHook.onUnsubscribe(_cmd);
+                        } catch (Throwable hookEx) {
+                            logger.warn("Error calling HystrixCommandExecutionHook.onUnsubscribe", hookEx);
+                        }
                         _cmd.executionResultAtTimeOfCancellation = _cmd.executionResult
                                 .addEvent((int) (System.currentTimeMillis() - _cmd.commandStartTimestamp), HystrixEventType.CANCELLED);
                     }
@@ -391,6 +398,11 @@ import java.util.concurrent.atomic.AtomicReference;
                 } else if (_cmd.commandState.compareAndSet(CommandState.USER_CODE_EXECUTED, CommandState.UNSUBSCRIBED)) {
                     if (!_cmd.executionResult.containsTerminalEvent()) {
                         _cmd.eventNotifier.markEvent(HystrixEventType.CANCELLED, _cmd.commandKey);
+                        try {
+                            executionHook.onUnsubscribe(_cmd);
+                        } catch (Throwable hookEx) {
+                            logger.warn("Error calling HystrixCommandExecutionHook.onUnsubscribe", hookEx);
+                        }
                         _cmd.executionResultAtTimeOfCancellation = _cmd.executionResult
                                 .addEvent((int) (System.currentTimeMillis() - _cmd.commandStartTimestamp), HystrixEventType.CANCELLED);
                     }
@@ -402,6 +414,9 @@ import java.util.concurrent.atomic.AtomicReference;
         final Func0<Observable<R>> applyHystrixSemantics = new Func0<Observable<R>>() {
             @Override
             public Observable<R> call() {
+                if (commandState.get().equals(CommandState.UNSUBSCRIBED)) {
+                    return Observable.never();
+                }
                 return applyHystrixSemantics(_cmd);
             }
         };
@@ -506,7 +521,7 @@ import java.util.concurrent.atomic.AtomicReference;
         executionHook.onStart(_cmd);
 
         /* determine if we're allowed to execute */
-        if (circuitBreaker.allowRequest()) {
+        if (circuitBreaker.attemptExecution()) {
             final TryableSemaphore executionSemaphore = getExecutionSemaphore();
             final AtomicBoolean semaphoreHasBeenReleased = new AtomicBoolean(false);
             final Action0 singleSemaphoreRelease = new Action0() {
@@ -563,9 +578,9 @@ import java.util.concurrent.atomic.AtomicReference;
                 }
                 if (commandIsScalar()) {
                     long latency = System.currentTimeMillis() - executionResult.getStartTimestamp();
-                    eventNotifier.markCommandExecution(getCommandKey(), properties.executionIsolationStrategy().get(), (int) latency, executionResult.getOrderedList());
                     eventNotifier.markEvent(HystrixEventType.SUCCESS, commandKey);
                     executionResult = executionResult.addEvent((int) latency, HystrixEventType.SUCCESS);
+                    eventNotifier.markCommandExecution(getCommandKey(), properties.executionIsolationStrategy().get(), (int) latency, executionResult.getOrderedList());
                     circuitBreaker.markSuccess();
                 }
             }
@@ -576,9 +591,9 @@ import java.util.concurrent.atomic.AtomicReference;
             public void call() {
                 if (!commandIsScalar()) {
                     long latency = System.currentTimeMillis() - executionResult.getStartTimestamp();
-                    eventNotifier.markCommandExecution(getCommandKey(), properties.executionIsolationStrategy().get(), (int) latency, executionResult.getOrderedList());
                     eventNotifier.markEvent(HystrixEventType.SUCCESS, commandKey);
                     executionResult = executionResult.addEvent((int) latency, HystrixEventType.SUCCESS);
+                    eventNotifier.markCommandExecution(getCommandKey(), properties.executionIsolationStrategy().get(), (int) latency, executionResult.getOrderedList());
                     circuitBreaker.markSuccess();
                 }
             }
@@ -587,6 +602,7 @@ import java.util.concurrent.atomic.AtomicReference;
         final Func1<Throwable, Observable<R>> handleFallback = new Func1<Throwable, Observable<R>>() {
             @Override
             public Observable<R> call(Throwable t) {
+                circuitBreaker.markNonSuccess();
                 Exception e = getExceptionFromThrowable(t);
                 executionResult = executionResult.setExecutionException(e);
                 if (e instanceof RejectedExecutionException) {
@@ -668,7 +684,7 @@ import java.util.concurrent.atomic.AtomicReference;
                         }
                     } else {
                         //command has already been unsubscribed, so return immediately
-                        return Observable.error(new RuntimeException("unsubscribed before executing run()"));
+                        return Observable.empty();
                     }
                 }
             }).doOnTerminate(new Action0() {
@@ -747,11 +763,10 @@ import java.util.concurrent.atomic.AtomicReference;
         executionResult = executionResult.addEvent((int) latency, eventType);
 
         if (isUnrecoverable(originalException)) {
-            Exception e = originalException;
-            logger.error("Unrecoverable Error for HystrixCommand so will throw HystrixRuntimeException and not apply fallback. ", e);
+            logger.error("Unrecoverable Error for HystrixCommand so will throw HystrixRuntimeException and not apply fallback. ", originalException);
 
             /* executionHook for all errors */
-            e = wrapWithOnErrorHook(failureType, e);
+            Exception e = wrapWithOnErrorHook(failureType, originalException);
             return Observable.error(new HystrixRuntimeException(failureType, this.getClass(), getLogMessagePrefix() + " " + message + " and encountered unrecoverable error.", e, null));
         } else {
             if (isRecoverableError(originalException)) {
@@ -790,30 +805,33 @@ import java.util.concurrent.atomic.AtomicReference;
                 final Func1<Throwable, Observable<R>> handleFallbackError = new Func1<Throwable, Observable<R>>() {
                     @Override
                     public Observable<R> call(Throwable t) {
-                        Exception e = originalException;
+                        /* executionHook for all errors */
+                        Exception e = wrapWithOnErrorHook(failureType, originalException);
                         Exception fe = getExceptionFromThrowable(t);
 
+                        long latency = System.currentTimeMillis() - executionResult.getStartTimestamp();
+                        Exception toEmit;
+
                         if (fe instanceof UnsupportedOperationException) {
-                            long latency = System.currentTimeMillis() - executionResult.getStartTimestamp();
                             logger.debug("No fallback for HystrixCommand. ", fe); // debug only since we're throwing the exception and someone higher will do something with it
                             eventNotifier.markEvent(HystrixEventType.FALLBACK_MISSING, commandKey);
                             executionResult = executionResult.addEvent((int) latency, HystrixEventType.FALLBACK_MISSING);
 
-                            /* executionHook for all errors */
-                            e = wrapWithOnErrorHook(failureType, e);
-
-                            return Observable.error(new HystrixRuntimeException(failureType, _cmd.getClass(), getLogMessagePrefix() + " " + message + " and no fallback available.", e, fe));
+                            toEmit = new HystrixRuntimeException(failureType, _cmd.getClass(), getLogMessagePrefix() + " " + message + " and no fallback available.", e, fe);
                         } else {
-                            long latency = System.currentTimeMillis() - executionResult.getStartTimestamp();
                             logger.debug("HystrixCommand execution " + failureType.name() + " and fallback failed.", fe);
                             eventNotifier.markEvent(HystrixEventType.FALLBACK_FAILURE, commandKey);
                             executionResult = executionResult.addEvent((int) latency, HystrixEventType.FALLBACK_FAILURE);
 
-                            /* executionHook for all errors */
-                            e = wrapWithOnErrorHook(failureType, e);
-
-                            return Observable.error(new HystrixRuntimeException(failureType, _cmd.getClass(), getLogMessagePrefix() + " " + message + " and fallback failed.", e, fe));
+                            toEmit = new HystrixRuntimeException(failureType, _cmd.getClass(), getLogMessagePrefix() + " " + message + " and fallback failed.", e, fe);
                         }
+
+                        // NOTE: we're suppressing fallback exception here
+                        if (shouldNotBeWrapped(originalException)) {
+                            return Observable.error(e);
+                        }
+
+                        return Observable.error(toEmit);
                     }
                 };
 
@@ -1029,10 +1047,15 @@ import java.util.concurrent.atomic.AtomicReference;
     private Observable<R> handleFallbackDisabledByEmittingError(Exception underlying, FailureType failureType, String message) {
         /* fallback is disabled so throw HystrixRuntimeException */
         logger.debug("Fallback disabled for HystrixCommand so will throw HystrixRuntimeException. ", underlying); // debug only since we're throwing the exception and someone higher will do something with it
+        eventNotifier.markEvent(HystrixEventType.FALLBACK_DISABLED, commandKey);
 
         /* executionHook for all errors */
         Exception wrapped = wrapWithOnErrorHook(failureType, underlying);
         return Observable.error(new HystrixRuntimeException(failureType, this.getClass(), getLogMessagePrefix() + " " + message + " and fallback disabled.", wrapped, null));
+    }
+
+    protected boolean shouldNotBeWrapped(Throwable underlying) {
+        return underlying instanceof ExceptionNotWrappedByHystrix;
     }
 
     /**
@@ -1110,17 +1133,8 @@ import java.util.concurrent.atomic.AtomicReference;
             // if the child unsubscribes we unsubscribe our parent as well
             child.add(s);
 
-            /*
-             * Define the action to perform on timeout outside of the TimerListener to it can capture the HystrixRequestContext
-             * of the calling thread which doesn't exist on the Timer thread.
-             */
-            final HystrixContextRunnable timeoutRunnable = new HystrixContextRunnable(originalCommand.concurrencyStrategy, new Runnable() {
-
-                @Override
-                public void run() {
-                    child.onError(new HystrixTimeoutException());
-                }
-            });
+            //capture the HystrixRequestContext upfront so that we can use it in the timeout thread later
+            final HystrixRequestContext hystrixRequestContext = HystrixRequestContext.getContextForCurrentThread();
 
             TimerListener listener = new TimerListener() {
 
@@ -1134,6 +1148,15 @@ import java.util.concurrent.atomic.AtomicReference;
 
                         // shut down the original request
                         s.unsubscribe();
+
+                        final HystrixContextRunnable timeoutRunnable = new HystrixContextRunnable(originalCommand.concurrencyStrategy, hystrixRequestContext, new Runnable() {
+
+                            @Override
+                            public void run() {
+                                child.onError(new HystrixTimeoutException());
+                            }
+                        });
+
 
                         timeoutRunnable.run();
                         //if it did not start, then we need to mark a command start for concurrency metrics, and then issue the timeout
@@ -1529,19 +1552,26 @@ import java.util.concurrent.atomic.AtomicReference;
     /**
      * Take an Exception and determine whether to throw it, its cause or a new HystrixRuntimeException.
      * <p>
-     * This will only throw an HystrixRuntimeException, HystrixBadRequestException or IllegalStateException
+     * This will only throw an HystrixRuntimeException, HystrixBadRequestException, IllegalStateException
+     * or any exception that implements ExceptionNotWrappedByHystrix.
      * 
      * @param e initial exception
      * @return HystrixRuntimeException, HystrixBadRequestException or IllegalStateException
      */
-    protected RuntimeException decomposeException(Exception e) {
+    protected Throwable decomposeException(Exception e) {
         if (e instanceof IllegalStateException) {
             return (IllegalStateException) e;
         }
         if (e instanceof HystrixBadRequestException) {
+            if (shouldNotBeWrapped(e.getCause())) {
+                return e.getCause();
+            }
             return (HystrixBadRequestException) e;
         }
         if (e.getCause() instanceof HystrixBadRequestException) {
+            if(shouldNotBeWrapped(e.getCause().getCause())) {
+                return e.getCause().getCause();
+            }
             return (HystrixBadRequestException) e.getCause();
         }
         if (e instanceof HystrixRuntimeException) {
@@ -1550,6 +1580,12 @@ import java.util.concurrent.atomic.AtomicReference;
         // if we have an exception we know about we'll throw it directly without the wrapper exception
         if (e.getCause() instanceof HystrixRuntimeException) {
             return (HystrixRuntimeException) e.getCause();
+        }
+        if (shouldNotBeWrapped(e)) {
+            return e;
+        }
+        if (shouldNotBeWrapped(e.getCause())) {
+            return e.getCause();
         }
         // we don't know what kind of exception this is so create a generic message and throw a new HystrixRuntimeException
         String message = getLogMessagePrefix() + " failed while executing.";
@@ -2164,6 +2200,11 @@ import java.util.concurrent.atomic.AtomicReference;
         @Override
         public <T> void onCacheHit(HystrixInvokable<T> commandInstance) {
             actual.onCacheHit(commandInstance);
+        }
+
+        @Override
+        public <T> void onUnsubscribe(HystrixInvokable<T> commandInstance) {
+            actual.onUnsubscribe(commandInstance);
         }
 
         @SuppressWarnings({ "unchecked", "rawtypes" })

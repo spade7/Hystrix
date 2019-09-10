@@ -29,6 +29,7 @@ import org.slf4j.LoggerFactory;
  * Implementation of {@link HystrixMetricsPublisherThreadPool} using Coda Hale Metrics (https://github.com/codahale/metrics)
  */
 public class HystrixCodaHaleMetricsPublisherThreadPool implements HystrixMetricsPublisherThreadPool {
+    private final String metricsRootNode;
     private final HystrixThreadPoolKey key;
     private final HystrixThreadPoolMetrics metrics;
     private final HystrixThreadPoolProperties properties;
@@ -38,7 +39,8 @@ public class HystrixCodaHaleMetricsPublisherThreadPool implements HystrixMetrics
 
     static final Logger logger = LoggerFactory.getLogger(HystrixCodaHaleMetricsPublisherThreadPool.class);
 
-    public HystrixCodaHaleMetricsPublisherThreadPool(HystrixThreadPoolKey threadPoolKey, HystrixThreadPoolMetrics metrics, HystrixThreadPoolProperties properties, MetricRegistry metricRegistry) {
+    public HystrixCodaHaleMetricsPublisherThreadPool(String metricsRootNode, HystrixThreadPoolKey threadPoolKey, HystrixThreadPoolMetrics metrics, HystrixThreadPoolProperties properties, MetricRegistry metricRegistry) {
+        this.metricsRootNode = metricsRootNode;
         this.key = threadPoolKey;
         this.metrics = metrics;
         this.properties = properties;
@@ -146,6 +148,20 @@ public class HystrixCodaHaleMetricsPublisherThreadPool implements HystrixMetrics
             }
         });
 
+        metricRegistry.register(createMetricName("propertyValue_maximumSize"), new Gauge<Number>() {
+            @Override
+            public Number getValue() {
+                return properties.maximumSize().get();
+            }
+        });
+
+        metricRegistry.register(createMetricName("propertyValue_actualMaximumSize"), new Gauge<Number>() {
+            @Override
+            public Number getValue() {
+                return properties.actualMaximumSize();
+            }
+        });
+
         metricRegistry.register(createMetricName("propertyValue_keepAliveTimeInMinutes"), new Gauge<Number>() {
             @Override
             public Number getValue() {
@@ -169,6 +185,6 @@ public class HystrixCodaHaleMetricsPublisherThreadPool implements HystrixMetrics
     }
 
     protected String createMetricName(String name) {
-        return MetricRegistry.name(metricGroup, metricType, name);
+        return MetricRegistry.name(metricsRootNode, metricGroup, metricType, name);
     }
 }

@@ -16,10 +16,13 @@
 package com.netflix.hystrix.contrib.javanica.test.common.error;
 
 import com.netflix.hystrix.HystrixEventType;
+import com.netflix.hystrix.HystrixInvokableInfo;
 import com.netflix.hystrix.HystrixRequestLog;
 import com.netflix.hystrix.contrib.javanica.annotation.HystrixCommand;
+import com.netflix.hystrix.contrib.javanica.annotation.HystrixProperty;
 import com.netflix.hystrix.contrib.javanica.test.common.BasicHystrixTest;
 import com.netflix.hystrix.contrib.javanica.test.common.domain.User;
+import com.netflix.hystrix.exception.ExceptionNotWrappedByHystrix;
 import com.netflix.hystrix.exception.HystrixRuntimeException;
 import org.junit.Before;
 import org.junit.Test;
@@ -27,11 +30,10 @@ import org.mockito.MockitoAnnotations;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.TimeoutException;
 
 import static com.netflix.hystrix.contrib.javanica.test.common.CommonUtils.getHystrixCommandByKey;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.*;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -110,7 +112,7 @@ public abstract class BasicErrorPropagationTest extends BasicHystrixTest {
         }
     }
 
-    @Test(expected = OperationException.class)
+    @Test(expected = RuntimeOperationException.class)
     public void testBlockUser() throws NotFoundException, ActivationException, OperationException {
         try {
             userService.blockUser("1"); // this method always throws ActivationException
@@ -126,6 +128,108 @@ public abstract class BasicErrorPropagationTest extends BasicHystrixTest {
     @Test(expected = NotFoundException.class)
     public void testPropagateCauseException() throws NotFoundException {
         userService.deleteUser("");
+    }
+
+    @Test(expected = UserException.class)
+    public void testUserExceptionThrownFromCommand() {
+        userService.userFailureWithoutFallback();
+    }
+
+    @Test
+    public void testHystrixExceptionThrownFromCommand() {
+        try {
+            userService.timedOutWithoutFallback();
+        } catch (HystrixRuntimeException e) {
+            assertEquals(TimeoutException.class, e.getCause().getClass());
+        } catch (Throwable e) {
+            assertTrue("'HystrixRuntimeException' is expected exception.", false);
+        }
+    }
+
+    @Test
+    public void testUserExceptionThrownFromFallback() {
+        try {
+            userService.userFailureWithFallback();
+        } catch (UserException e) {
+            assertEquals(1, e.level);
+        } catch (Throwable e) {
+            assertTrue("'UserException' is expected exception.", false);
+        }
+    }
+
+    @Test
+    public void testUserExceptionThrownFromFallbackCommand() {
+        try {
+            userService.userFailureWithFallbackCommand();
+        } catch (UserException e) {
+            assertEquals(2, e.level);
+        } catch (Throwable e) {
+            assertTrue("'UserException' is expected exception.", false);
+        }
+    }
+
+    @Test
+    public void testCommandAndFallbackErrorsComposition() {
+        try {
+            userService.commandAndFallbackErrorsComposition();
+        } catch (HystrixFlowException e) {
+            assertEquals(UserException.class, e.commandException.getClass());
+            assertEquals(UserException.class, e.fallbackException.getClass());
+
+            UserException commandException = (UserException) e.commandException;
+            UserException fallbackException = (UserException) e.fallbackException;
+            assertEquals(0, commandException.level);
+            assertEquals(1, fallbackException.level);
+
+
+        } catch (Throwable e) {
+            assertTrue("'HystrixFlowException' is expected exception.", false);
+        }
+    }
+
+    @Test
+    public void testCommandWithFallbackThatFailsByTimeOut() {
+        try {
+            userService.commandWithFallbackThatFailsByTimeOut();
+        } catch (HystrixRuntimeException e) {
+            assertEquals(TimeoutException.class, e.getCause().getClass());
+        } catch (Throwable e) {
+            assertTrue("'HystrixRuntimeException' is expected exception.", false);
+        }
+    }
+
+    @Test
+    public void testCommandWithNotWrappedExceptionAndNoFallback() {
+        try {
+            userService.throwNotWrappedCheckedExceptionWithoutFallback();
+            fail();
+        } catch (NotWrappedCheckedException e) {
+            // pass
+        } catch (Throwable e) {
+            fail("'NotWrappedCheckedException' is expected exception.");
+        }finally {
+            assertEquals(1, HystrixRequestLog.getCurrentRequest().getAllExecutedCommands().size());
+            HystrixInvokableInfo getUserCommand = getHystrixCommandByKey("throwNotWrappedCheckedExceptionWithoutFallback");
+            // record failure in metrics
+            assertTrue(getUserCommand.getExecutionEvents().contains(HystrixEventType.FAILURE));
+            // and will not trigger fallback logic
+            verify(failoverService, never()).activate();
+        }
+    }
+
+    @Test
+    public void testCommandWithNotWrappedExceptionAndFallback() {
+        try {
+            userService.throwNotWrappedCheckedExceptionWithFallback();
+        } catch (NotWrappedCheckedException e) {
+            fail();
+        } finally {
+            assertEquals(1, HystrixRequestLog.getCurrentRequest().getAllExecutedCommands().size());
+            HystrixInvokableInfo getUserCommand = getHystrixCommandByKey("throwNotWrappedCheckedExceptionWithFallback");
+            assertTrue(getUserCommand.getExecutionEvents().contains(HystrixEventType.FAILURE));
+            assertTrue(getUserCommand.getExecutionEvents().contains(HystrixEventType.FALLBACK_SUCCESS));
+            verify(failoverService).activate();
+        }
     }
 
     public static class UserService {
@@ -199,6 +303,84 @@ public abstract class BasicErrorPropagationTest extends BasicHystrixTest {
                 throw new BadRequestException("parameter cannot be null ot empty");
             }
         }
+
+        @HystrixCommand
+        void throwNotWrappedCheckedExceptionWithoutFallback() throws NotWrappedCheckedException {
+            throw new NotWrappedCheckedException();
+        }
+
+        @HystrixCommand(fallbackMethod = "voidFallback")
+        void throwNotWrappedCheckedExceptionWithFallback() throws NotWrappedCheckedException {
+            throw new NotWrappedCheckedException();
+        }
+
+        private void voidFallback(){
+            failoverService.activate();
+        }
+
+        /*********************************************************************************/
+
+        @HystrixCommand
+        String userFailureWithoutFallback() throws UserException {
+            throw new UserException();
+        }
+
+        @HystrixCommand(commandProperties = {@HystrixProperty(name = "execution.isolation.thread.timeoutInMilliseconds", value = "1")})
+        String timedOutWithoutFallback() {
+            return "";
+        }
+
+        /*********************************************************************************/
+
+        @HystrixCommand(fallbackMethod = "userFailureWithFallback_f_0")
+        String userFailureWithFallback() {
+            throw new UserException();
+        }
+
+        String userFailureWithFallback_f_0() {
+            throw new UserException(1);
+        }
+
+        /*********************************************************************************/
+
+        @HystrixCommand(fallbackMethod = "userFailureWithFallbackCommand_f_0")
+        String userFailureWithFallbackCommand() {
+            throw new UserException(0);
+        }
+
+        @HystrixCommand(fallbackMethod = "userFailureWithFallbackCommand_f_1")
+        String userFailureWithFallbackCommand_f_0() {
+            throw new UserException(1);
+        }
+
+        @HystrixCommand
+        String userFailureWithFallbackCommand_f_1() {
+            throw new UserException(2);
+        }
+
+        /*********************************************************************************/
+
+        @HystrixCommand(fallbackMethod = "commandAndFallbackErrorsComposition_f_0")
+        String commandAndFallbackErrorsComposition() {
+            throw new UserException();
+        }
+
+
+        String commandAndFallbackErrorsComposition_f_0(Throwable commandError) {
+            throw new HystrixFlowException(commandError, new UserException(1));
+        }
+
+        /*********************************************************************************/
+
+        @HystrixCommand(fallbackMethod = "commandWithFallbackThatFailsByTimeOut_f_0")
+        String commandWithFallbackThatFailsByTimeOut() {
+            throw new UserException(0);
+        }
+
+        @HystrixCommand(commandProperties = {@HystrixProperty(name = "execution.isolation.thread.timeoutInMilliseconds", value = "1")})
+        String commandWithFallbackThatFailsByTimeOut_f_0() {
+            return "";
+        }
     }
 
     private class FailoverService {
@@ -238,6 +420,31 @@ public abstract class BasicErrorPropagationTest extends BasicHystrixTest {
     private static class RuntimeOperationException extends RuntimeException {
         private RuntimeOperationException(String message) {
             super(message);
+        }
+    }
+
+    private static class NotWrappedCheckedException extends Exception implements ExceptionNotWrappedByHystrix {
+    }
+
+    static class UserException extends RuntimeException {
+        final int level;
+
+        public UserException() {
+            this(0);
+        }
+
+        public UserException(int level) {
+            this.level = level;
+        }
+    }
+
+    static class HystrixFlowException extends RuntimeException {
+        final Throwable commandException;
+        final Throwable fallbackException;
+
+        public HystrixFlowException(Throwable commandException, Throwable fallbackException) {
+            this.commandException = commandException;
+            this.fallbackException = fallbackException;
         }
     }
 

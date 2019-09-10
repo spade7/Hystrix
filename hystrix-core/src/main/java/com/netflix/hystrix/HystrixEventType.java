@@ -38,11 +38,13 @@ public enum HystrixEventType {
     FALLBACK_SUCCESS(true),
     FALLBACK_FAILURE(true),
     FALLBACK_REJECTION(true),
+    FALLBACK_DISABLED(true),
     FALLBACK_MISSING(true),
     EXCEPTION_THROWN(false),
     RESPONSE_FROM_CACHE(true),
     CANCELLED(true),
-    COLLAPSED(false);
+    COLLAPSED(false),
+    COMMAND_MAX_ACTIVE(false);
 
     private final boolean isTerminal;
 
@@ -67,11 +69,13 @@ public enum HystrixEventType {
             case FALLBACK_SUCCESS: return FALLBACK_SUCCESS;
             case FALLBACK_FAILURE: return FALLBACK_FAILURE;
             case FALLBACK_REJECTION: return FALLBACK_REJECTION;
+            case FALLBACK_DISABLED: return FALLBACK_DISABLED;
             case FALLBACK_MISSING: return FALLBACK_MISSING;
             case EXCEPTION_THROWN: return EXCEPTION_THROWN;
             case RESPONSE_FROM_CACHE: return RESPONSE_FROM_CACHE;
             case COLLAPSED: return COLLAPSED;
             case BAD_REQUEST: return BAD_REQUEST;
+            case COMMAND_MAX_ACTIVE: return COMMAND_MAX_ACTIVE;
             default:
                 throw new RuntimeException("Not an event that can be converted to HystrixEventType : " + event);
         }
@@ -90,6 +94,7 @@ public enum HystrixEventType {
     static {
         EXCEPTION_PRODUCING_EVENT_TYPES.add(BAD_REQUEST);
         EXCEPTION_PRODUCING_EVENT_TYPES.add(FALLBACK_FAILURE);
+        EXCEPTION_PRODUCING_EVENT_TYPES.add(FALLBACK_DISABLED);
         EXCEPTION_PRODUCING_EVENT_TYPES.add(FALLBACK_MISSING);
         EXCEPTION_PRODUCING_EVENT_TYPES.add(FALLBACK_REJECTION);
 
